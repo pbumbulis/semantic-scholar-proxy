@@ -9,6 +9,9 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,11 +68,21 @@ func newHandler(apiKey, targetRaw string, limiter *rate.Limiter) (http.Handler, 
 		return nil, fmt.Errorf("invalid target URL: %w", err)
 	}
 
+	var backoffUntil atomic.Pointer[time.Time]
+
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = target.Host
 			pr.Out.Header.Set("x-api-key", apiKey)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				until := parseRetryAfter(resp.Header.Get("Retry-After"))
+				backoffUntil.Store(&until)
+				slog.Warn("upstream rate limited", "retry-after", resp.Header.Get("Retry-After"), "backoff-until", until)
+			}
+			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			slog.Error("proxy error", "err", err, "path", r.URL.Path)
@@ -86,14 +99,37 @@ func newHandler(apiKey, targetRaw string, limiter *rate.Limiter) (http.Handler, 
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if err := limiter.Wait(r.Context()); err != nil {
-			// Context cancelled (client disconnected) or deadline exceeded.
 			http.Error(w, "request cancelled", http.StatusServiceUnavailable)
 			return
+		}
+		if until := backoffUntil.Load(); until != nil {
+			if delay := time.Until(*until); delay > 0 {
+				select {
+				case <-time.After(delay):
+				case <-r.Context().Done():
+					http.Error(w, "request cancelled", http.StatusServiceUnavailable)
+					return
+				}
+			}
 		}
 		proxy.ServeHTTP(w, r)
 	})
 
 	return mux, nil
+}
+
+// parseRetryAfter converts a Retry-After header value to an absolute time.
+// Handles both integer seconds and HTTP-date formats per RFC 9110 §10.2.3.
+// Falls back to a 1-second backoff if the header is absent or unparseable.
+func parseRetryAfter(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if secs, err := strconv.Atoi(v); err == nil {
+		return time.Now().Add(time.Duration(secs) * time.Second)
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return t
+	}
+	return time.Now().Add(time.Second)
 }
 
 func mustEnv(key string) string {
