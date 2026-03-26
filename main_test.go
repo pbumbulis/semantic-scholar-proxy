@@ -10,6 +10,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// Ensures /health returns 200 "ok" so Kubernetes liveness and readiness probes pass without hitting the upstream.
 func TestHealthCheck(t *testing.T) {
 	h, err := newHandler("key", "http://unused", rate.NewLimiter(rate.Inf, 1))
 	if err != nil {
@@ -27,6 +28,7 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+// Ensures the configured API key is sent to the upstream on every proxied request.
 func TestAPIKeyInjected(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("x-api-key"); got != "test-key" {
@@ -49,6 +51,7 @@ func TestAPIKeyInjected(t *testing.T) {
 	}
 }
 
+// Ensures a client-supplied x-api-key is replaced, preventing clients from using their own key against the upstream quota.
 func TestAPIKeyOverwritesClientKey(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("x-api-key"); got != "server-key" {
@@ -74,6 +77,7 @@ func TestAPIKeyOverwritesClientKey(t *testing.T) {
 	}
 }
 
+// Ensures the full request path is preserved when forwarding to the upstream, so clients can reach any Semantic Scholar endpoint.
 func TestRequestForwardedToUpstream(t *testing.T) {
 	var receivedPath string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +99,7 @@ func TestRequestForwardedToUpstream(t *testing.T) {
 	}
 }
 
+// Ensures a connection failure to the upstream produces a 502, not a 500 or a panic.
 func TestUpstreamErrorReturns502(t *testing.T) {
 	// Point at a server that is immediately closed so the connection is refused.
 	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
@@ -113,6 +118,7 @@ func TestUpstreamErrorReturns502(t *testing.T) {
 	}
 }
 
+// Ensures requests block on the rate limiter and return 503 when the caller cancels rather than waiting, preserving upstream quota.
 func TestRateLimiterBlocksSecondRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -147,6 +153,7 @@ func TestRateLimiterBlocksSecondRequest(t *testing.T) {
 	}
 }
 
+// Ensures newHandler rejects a malformed target URL at construction time rather than failing at request time.
 func TestInvalidTargetURL(t *testing.T) {
 	_, err := newHandler("k", "://bad url", rate.NewLimiter(rate.Inf, 1))
 	if err == nil {
@@ -156,6 +163,7 @@ func TestInvalidTargetURL(t *testing.T) {
 
 // --- Retry-After / 429 handling ---
 
+// Ensures a numeric Retry-After value (delta-seconds) is interpreted as an offset from now, not as a Unix timestamp.
 func TestParseRetryAfterSeconds(t *testing.T) {
 	before := time.Now()
 	got := parseRetryAfter("30")
@@ -165,6 +173,7 @@ func TestParseRetryAfterSeconds(t *testing.T) {
 	}
 }
 
+// Ensures an HTTP-date Retry-After value is parsed correctly so the backoff deadline matches what the upstream requested.
 func TestParseRetryAfterHTTPDate(t *testing.T) {
 	future := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	header := future.Format(http.TimeFormat)
@@ -174,6 +183,7 @@ func TestParseRetryAfterHTTPDate(t *testing.T) {
 	}
 }
 
+// Ensures a missing Retry-After header falls back to a ~1-second backoff rather than blocking indefinitely or returning immediately.
 func TestParseRetryAfterEmpty(t *testing.T) {
 	before := time.Now()
 	got := parseRetryAfter("")
@@ -183,6 +193,7 @@ func TestParseRetryAfterEmpty(t *testing.T) {
 	}
 }
 
+// Ensures a 429 response from the upstream activates the backoff, causing subsequent requests to block until Retry-After elapses.
 func TestBackoffBlocksAfter429(t *testing.T) {
 	// Upstream returns 429 with a Retry-After far in the future.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -213,6 +224,7 @@ func TestBackoffBlocksAfter429(t *testing.T) {
 	}
 }
 
+// Ensures the backoff clears once its deadline passes so requests resume normally without requiring a restart.
 func TestBackoffClearsAfterExpiry(t *testing.T) {
 	// Upstream: first call returns 429 with an already-elapsed Retry-After,
 	// second call returns 200.
