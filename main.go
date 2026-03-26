@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -19,15 +20,50 @@ func main() {
 	listenAddr := envOr("LISTEN_ADDR", ":8080")
 	targetRaw := envOr("TARGET_URL", "https://api.semanticscholar.org")
 
-	target, err := url.Parse(targetRaw)
+	// 1 request per second, burst of 1 — matches Semantic Scholar's rate limit.
+	limiter := rate.NewLimiter(rate.Every(time.Second), 1)
+
+	handler, err := newHandler(apiKey, targetRaw, limiter)
 	if err != nil {
-		slog.Error("invalid TARGET_URL", "err", err)
+		slog.Error("failed to build handler", "err", err)
 		os.Exit(1)
 	}
 
-	// 1 request per second, burst of 1 — matches Semantic Scholar's unauthenticated limit.
-	// With a valid API key the limit is higher, but we stay conservative.
-	limiter := rate.NewLimiter(rate.Every(time.Second), 1)
+	srv := &http.Server{
+		Addr:         listenAddr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		slog.Info("listening", "addr", listenAddr, "target", targetRaw)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	slog.Info("shutting down")
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("shutdown error", "err", err)
+	}
+}
+
+// newHandler builds the HTTP handler. Extracted for testability.
+func newHandler(apiKey, targetRaw string, limiter *rate.Limiter) (http.Handler, error) {
+	target, err := url.Parse(targetRaw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid target URL: %w", err)
+	}
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -57,33 +93,7 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 
-	srv := &http.Server{
-		Addr:         listenAddr,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	go func() {
-		slog.Info("listening", "addr", listenAddr, "target", targetRaw)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("server error", "err", err)
-			os.Exit(1)
-		}
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	slog.Info("shutting down")
-	if err := srv.Shutdown(ctx); err != nil {
-		slog.Error("shutdown error", "err", err)
-	}
+	return mux, nil
 }
 
 func mustEnv(key string) string {

@@ -9,10 +9,9 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /semantic-scholar-proxy .
 
 # ---- final ----
-FROM scratch
-
-# TLS root certificates needed to reach api.semanticscholar.org (HTTPS).
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# distroless/static ships CA certs, /etc/passwd (nonroot user), and nothing else.
+# Equivalent to scratch + manual cert copy, but Google-maintained.
+FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /semantic-scholar-proxy /semantic-scholar-proxy
 
